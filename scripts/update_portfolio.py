@@ -15,6 +15,9 @@ SWING Portfolio 자동 업데이트 스크립트
 
 import os
 import requests
+import time
+import pandas as pd
+import matplotlib.dates as mdates
 from datetime import datetime, timezone, timedelta
 
 import matplotlib
@@ -36,6 +39,17 @@ HOLDINGS_DS_ID = "89b0cb64-c32a-4646-a336-72af409d81f5"      # 보유주식
 TOTAL_ASSETS_DS_ID = "14fc5390-f230-4332-8682-740ab1548b86"  # 총자산
 WATCHLIST_DS_ID = "fb2cee25-90a8-41e5-9224-50eb53b3d05b"     # 관심종목
 PAGE_ID = "38104f81-11a0-81c2-9a8c-d3b4e738aa2b"
+LEADING_PAGE_ID = "38104f81-11a0-81c2-9a8c-d3b4e738aa2b"   # JHING Portfolio 메인 페이지
+RESULTS_DS_ID = "c33ca7b7-17f3-45c2-95fc-07b53752bd2b"      # 주도대장주 결과 DB
+
+WICS_SECTORS = {
+    "에너지": "G10", "소재": "G15", "산업재": "G20", "자유소비재": "G25",
+    "필수소비재": "G30", "건강관리": "G35", "금융": "G40", "IT": "G45",
+    "커뮤니케이션서비스": "G50", "유틸리티": "G55",
+}
+TOP_N_PER_SECTOR = 5
+LEAD_LOOKBACK_DAYS = 400
+LEAD_RETURN_WINDOW_DAYS = 183
 
 # 나스닥100은 FinanceDataReader가 지수 코드를 직접 지원하지 않아 추적 ETF인 QQQ로 대체합니다.
 BENCHMARK_TICKERS = {
@@ -457,6 +471,241 @@ def draw_index_chart(chart_groups):
     plt.close()
 
 
+# ───────────────────────── 7) 국내 주도대장주 분석 ─────────────────────────
+
+def find_recent_wics_date(max_tries=10):
+    """오늘부터 거슬러 올라가며 WICS 데이터가 존재하는 가장 최근 영업일을 찾습니다."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    d = datetime.now(KST)
+    for _ in range(max_tries):
+        date_str = d.strftime("%Y%m%d")
+        url = (f"http://www.wiseindex.com/Index/GetIndexComponets"
+               f"?ceil_yn=0&dt={date_str}&idx=WICS&seq=G10")
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            data = resp.json()
+            if data.get("list"):
+                return date_str
+        except Exception:
+            pass
+        d -= timedelta(days=1)
+    raise RuntimeError("최근 영업일의 WICS 데이터를 찾지 못했습니다.")
+
+
+def fetch_wics_data(date_str):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    rows = []
+    for sector_name, seq in WICS_SECTORS.items():
+        url = (f"http://www.wiseindex.com/Index/GetIndexComponets"
+               f"?ceil_yn=0&dt={date_str}&idx=WICS&seq={seq}")
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        for item in data.get("list", []):
+            rows.append({
+                "종목코드": item.get("CMP_CD"),
+                "종목명": item.get("CMP_KOR"),
+                "섹터": sector_name,
+            })
+        time.sleep(0.3)
+    df = pd.DataFrame(rows)
+    print(f"[INFO] WICS 수집 완료: {len(df)}개 종목")
+    print(df.groupby("섹터").size())
+    return df
+
+
+def fetch_kospi_listing():
+    df = fdr.StockListing("KOSPI")
+    df = df.rename(columns={"Code": "종목코드", "Marcap": "시가총액"})
+    df["종목코드"] = df["종목코드"].astype(str).str.zfill(6)
+    df["시가총액"] = pd.to_numeric(df["시가총액"], errors="coerce")
+    df = df.dropna(subset=["시가총액"])
+    return df[["종목코드", "시가총액"]]
+
+
+def build_sector_leaders():
+    wics_date = find_recent_wics_date()
+    print(f"[INFO] WICS 기준일: {wics_date}")
+    wics_df = fetch_wics_data(wics_date)
+    kospi_df = fetch_kospi_listing()
+
+    merged = wics_df.merge(kospi_df, on="종목코드", how="inner")
+    merged = merged.dropna(subset=["섹터", "시가총액"])
+
+    leaders = (
+        merged.sort_values("시가총액", ascending=False)
+        .groupby("섹터", group_keys=False)
+        .head(TOP_N_PER_SECTOR)
+        .reset_index(drop=True)
+    )
+    print(f"[INFO] 섹터 대장주 {len(leaders)}개 추출 완료")
+    return leaders, wics_date
+
+
+def analyze_leading_stock(ticker, start_date):
+    df = fdr.DataReader(ticker, start_date)
+    if df is None or len(df) < 130:
+        return None
+    close = df["Close"]
+    current_price = close.iloc[-1]
+
+    ma20 = close.rolling(20).mean().iloc[-1]
+    ma60 = close.rolling(60).mean().iloc[-1]
+    ma120 = close.rolling(120).mean().iloc[-1]
+
+    one_year = close[close.index >= (close.index[-1] - pd.Timedelta(days=365))]
+    high_52w = one_year.max()
+
+    six_month = close[close.index >= (close.index[-1] - pd.Timedelta(days=LEAD_RETURN_WINDOW_DAYS))]
+    if len(six_month) < 2:
+        return None
+    six_month_return = (six_month.iloc[-1] / six_month.iloc[0] - 1) * 100
+
+    return {
+        "현재가": current_price, "MA20": ma20, "MA60": ma60, "MA120": ma120,
+        "52주최고가": high_52w, "6개월수익률": six_month_return,
+        "series": normalized_pct_series(six_month),
+    }
+
+
+def judge_leading_conditions(stock, bench_return):
+    failed = []
+    if not (stock["6개월수익률"] > bench_return):
+        failed.append("1")
+    if not (stock["현재가"] > stock["MA120"]):
+        failed.append("2")
+    if not (stock["MA20"] > stock["MA60"]):
+        failed.append("3")
+    high_ratio = stock["현재가"] / stock["52주최고가"] * 100
+    if not (high_ratio >= 80):
+        failed.append("4")
+    verdict = "주도주" if not failed else "제외"
+    return verdict, failed, high_ratio
+
+
+_leading_results_cache = None
+
+
+def upsert_leading_result(row):
+    global _leading_results_cache
+    if _leading_results_cache is None:
+        _leading_results_cache = {get_rich_text(p["properties"]["티커"]): p["id"]
+                                   for p in query_data_source(RESULTS_DS_ID)}
+
+    properties = {
+        "종목명": {"title": [{"text": {"content": row["종목명"]}}]},
+        "티커": {"rich_text": [{"text": {"content": row["종목코드"]}}]},
+        "섹터": {"rich_text": [{"text": {"content": row["섹터"]}}]},
+        "6개월수익률": {"number": round(row["6개월수익률"] / 100, 4)},
+        "상대수익률": {"number": round(row["상대수익률"] / 100, 4)},
+        "52주고점비율": {"number": round(row["52주고점비율"] / 100, 4)},
+        "판정": {"select": {"name": row["판정"]}},
+        "미충족조건": {"rich_text": [{"text": {"content": row["미충족조건"]}}]},
+    }
+
+    page_id = _leading_results_cache.get(row["종목코드"])
+    if page_id:
+        requests.patch(f"{BASE_URL}/pages/{page_id}", headers=HEADERS,
+                        json={"properties": properties}, timeout=30).raise_for_status()
+    else:
+        resp = requests.post(
+            f"{BASE_URL}/pages", headers=HEADERS,
+            json={"parent": {"type": "data_source_id", "data_source_id": RESULTS_DS_ID},
+                  "properties": properties}, timeout=30)
+        resp.raise_for_status()
+        _leading_results_cache[row["종목코드"]] = resp.json()["id"]
+
+
+def update_leading_summary(analysis_date, bench_return, n_leading, n_total):
+    resp = requests.get(f"{BASE_URL}/blocks/{LEADING_PAGE_ID}/children", headers=HEADERS,
+                         params={"page_size": 100}, timeout=30)
+    resp.raise_for_status()
+    summary_text = (
+        f"🏆 분석일: {analysis_date}   |   기준: KOSPI200({bench_return:+.2f}%)   |   "
+        f"주도주: {n_leading}개 선별 / 전체 {n_total}개 분석   |   주도주 조건: 4개 조건 모두 충족"
+    )
+    for block in resp.json()["results"]:
+        btype = block.get("type")
+        rich = block.get(btype, {}).get("rich_text", [])
+        text = "".join(t.get("plain_text", "") for t in rich)
+        if text.startswith("🏆 분석일"):
+            requests.patch(
+                f"{BASE_URL}/blocks/{block['id']}", headers=HEADERS,
+                json={btype: {"rich_text": [{"type": "text", "text": {"content": summary_text}}]}},
+                timeout=30,
+            ).raise_for_status()
+            return
+    print("[WARN] 주도대장주 요약 블록을 찾지 못해 갱신을 건너뜁니다.")
+
+
+def draw_leading_chart(leading_stocks, bench_series, analysis_date):
+    os.makedirs("charts", exist_ok=True)
+    plt.figure(figsize=(11, 6))
+    plt.plot(bench_series.index, bench_series.values, linestyle="--", color="gray",
+              label=f"KOSPI200 ({bench_series.iloc[-1]:+.1f}%)")
+    for name, ticker, series, ret in leading_stocks:
+        plt.plot(series.index, series.values, marker="o", markersize=3,
+                  label=f"{name}({ticker}) ({ret:+.1f}%)")
+
+    plt.title(f"국내 주도대장주 수익률 분석 ({analysis_date})")
+    plt.ylabel("누적수익률 (%)")
+    plt.gca().xaxis.set_major_locator(mdates.MonthLocator())
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    plt.xticks(rotation=45, ha="right")
+    plt.axhline(0, color="lightgray", linewidth=0.8)
+    plt.legend(fontsize=8, loc="upper left")
+    plt.tight_layout()
+    plt.savefig("charts/leading_stocks.png", dpi=150)
+    plt.close()
+
+
+def run_leading_stocks_analysis():
+    if fdr is None:
+        return
+    leaders, wics_date = build_sector_leaders()
+    analysis_date = f"{wics_date[:4]}-{wics_date[4:6]}-{wics_date[6:]}"
+    start_date = (datetime.now(KST) - timedelta(days=LEAD_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+
+    bench_data = analyze_leading_stock("KS200", start_date)
+    if bench_data is None:
+        print("[ERROR] KOSPI200 데이터를 가져오지 못해 주도대장주 분석을 중단합니다.")
+        return
+    bench_return = bench_data["6개월수익률"]
+    bench_series = bench_data["series"]
+
+    results = []
+    leading_stocks = []
+    for _, row in leaders.iterrows():
+        stock_data = analyze_leading_stock(row["종목코드"], start_date)
+        if stock_data is None:
+            print(f"[WARN] {row['종목명']}({row['종목코드']}) 데이터 부족으로 건너뜁니다.")
+            continue
+
+        verdict, failed, high_ratio = judge_leading_conditions(stock_data, bench_return)
+        relative_return = stock_data["6개월수익률"] - bench_return
+
+        result_row = {
+            "종목코드": row["종목코드"], "종목명": row["종목명"], "섹터": row["섹터"],
+            "6개월수익률": stock_data["6개월수익률"], "상대수익률": relative_return,
+            "52주고점비율": high_ratio, "판정": verdict,
+            "미충족조건": ",".join(failed) if failed else "-",
+        }
+        results.append(result_row)
+
+        if verdict == "주도주":
+            leading_stocks.append((row["종목명"], row["종목코드"],
+                                    stock_data["series"], stock_data["6개월수익률"]))
+
+    results.sort(key=lambda r: r["상대수익률"], reverse=True)
+    for row in results:
+        upsert_leading_result(row)
+
+    leading_stocks.sort(key=lambda x: x[3], reverse=True)
+    draw_leading_chart(leading_stocks, bench_series, analysis_date)
+    update_leading_summary(analysis_date, bench_return, len(leading_stocks), len(results))
+    print(f"주도대장주 분석 완료: 전체 {len(results)}개 분석, 주도주 {len(leading_stocks)}개 선별")
+
+
 # ───────────────────────── 메인 실행 ─────────────────────────
 
 def main():
@@ -481,6 +730,7 @@ def main():
         print("매매일지가 비어 있어 보유주식/총자산 갱신을 건너뜁니다.")
 
     run_index_analysis()
+    run_leading_stocks_analysis()
     print("업데이트 완료")
 
 
