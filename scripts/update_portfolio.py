@@ -35,6 +35,7 @@ TRADE_LOG_DS_ID = "9a0c7b65-17c2-4042-973d-075ed4421ba0"     # 매매일지
 HOLDINGS_DS_ID = "89b0cb64-c32a-4646-a336-72af409d81f5"      # 보유주식
 TOTAL_ASSETS_DS_ID = "14fc5390-f230-4332-8682-740ab1548b86"  # 총자산
 WATCHLIST_DS_ID = "fb2cee25-90a8-41e5-9224-50eb53b3d05b"     # 관심종목
+PAGE_ID = "38104f81-11a0-81c2-9a8c-d3b4e738aa2b"
 
 # 나스닥100은 FinanceDataReader가 지수 코드를 직접 지원하지 않아 추적 ETF인 QQQ로 대체합니다.
 BENCHMARK_TICKERS = {
@@ -230,7 +231,30 @@ def append_total_assets_snapshot(total_valuation, total_profit, total_cost):
             f"{BASE_URL}/pages", headers=HEADERS,
             json={"parent": {"type": "data_source_id", "data_source_id": TOTAL_ASSETS_DS_ID},
                   "properties": properties}, timeout=30).raise_for_status()
-
+def update_summary_banner(total_valuation, total_profit, profit_rate):
+    """페이지 맨 위 요약 줄(총평가금액/총수익/총수익률)을 최신 값으로 갱신합니다."""
+    resp = requests.get(f"{BASE_URL}/blocks/{PAGE_ID}/children", headers=HEADERS,
+                         params={"page_size": 100}, timeout=30)
+    resp.raise_for_status()
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    summary_text = (
+        f"📅 데이터 기준일: {today}   "
+        f"💰 총평가금액 {total_valuation:,.0f}원   "
+        f"📈 총수익 {total_profit:+,.0f}원   "
+        f"📊 총수익률 {profit_rate * 100:+.2f}%"
+    )
+    for block in resp.json()["results"]:
+        btype = block.get("type")
+        rich = block.get(btype, {}).get("rich_text", [])
+        text = "".join(t.get("plain_text", "") for t in rich)
+        if text.startswith("📅 데이터 기준일"):
+            requests.patch(
+                f"{BASE_URL}/blocks/{block['id']}", headers=HEADERS,
+                json={btype: {"rich_text": [{"type": "text", "text": {"content": summary_text}}]}},
+                timeout=30,
+            ).raise_for_status()
+            return
+    print("[WARN] 요약 배너 블록을 찾지 못해 갱신을 건너뜁니다.")
 
 # ───────────────────────── 4) 차트 생성 ─────────────────────────
 
@@ -444,6 +468,8 @@ def main():
                 total_cost += result["cost"]
 
         append_total_assets_snapshot(total_valuation, total_profit, total_cost)
+        profit_rate = (total_profit / total_cost) if total_cost else 0
+        update_summary_banner(total_valuation, total_profit, profit_rate)
         draw_chart()
         draw_category_chart()
     else:
