@@ -232,30 +232,35 @@ def append_total_assets_snapshot(total_valuation, total_profit, total_cost):
             json={"parent": {"type": "data_source_id", "data_source_id": TOTAL_ASSETS_DS_ID},
                   "properties": properties}, timeout=30).raise_for_status()
 def update_summary_banner(total_valuation, total_profit, profit_rate):
-    """페이지 맨 위 요약 줄(총평가금액/총수익/총수익률)을 최신 값으로 갱신합니다."""
+    """페이지 맨 위 요약 두 줄(작성일자 / 총평가금액·총수익·총수익률)을 굵게 갱신합니다."""
     resp = requests.get(f"{BASE_URL}/blocks/{PAGE_ID}/children", headers=HEADERS,
                          params={"page_size": 100}, timeout=30)
     resp.raise_for_status()
     today = datetime.now(KST).strftime("%Y-%m-%d")
-    summary_text = (
-        f"📅 데이터 기준일: {today}   "
-        f"💰 총평가금액 {total_valuation:,.0f}원   "
-        f"📈 총수익 {total_profit:+,.0f}원   "
-        f"📊 총수익률 {profit_rate * 100:+.2f}%"
-    )
+
+    line1 = f"📅 작성일자: {today}"
+    line2 = (f"💰 총평가금액 {total_valuation:,.0f}원   "
+             f"📈 총수익 {total_profit:+,.0f}원   "
+             f"📊 총수익률 {profit_rate * 100:+.2f}%")
+
+    def set_bold(block_id, btype, content):
+        requests.patch(
+            f"{BASE_URL}/blocks/{block_id}", headers=HEADERS,
+            json={btype: {"rich_text": [
+                {"type": "text", "text": {"content": content},
+                 "annotations": {"bold": True}}
+            ]}},
+            timeout=30,
+        ).raise_for_status()
+
     for block in resp.json()["results"]:
         btype = block.get("type")
         rich = block.get(btype, {}).get("rich_text", [])
         text = "".join(t.get("plain_text", "") for t in rich)
-        if text.startswith("📅 데이터 기준일"):
-            requests.patch(
-                f"{BASE_URL}/blocks/{block['id']}", headers=HEADERS,
-                json={btype: {"rich_text": [{"type": "text", "text": {"content": summary_text}}]}},
-                timeout=30,
-            ).raise_for_status()
-            return
-    print("[WARN] 요약 배너 블록을 찾지 못해 갱신을 건너뜁니다.")
-
+        if text.startswith("📅 작성일자"):
+            set_bold(block["id"], btype, line1)
+        elif text.startswith("💰 총평가금액"):
+            set_bold(block["id"], btype, line2)
 # ───────────────────────── 4) 차트 생성 ─────────────────────────
 
 def draw_chart():
