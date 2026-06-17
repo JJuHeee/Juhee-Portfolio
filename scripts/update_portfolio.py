@@ -219,6 +219,44 @@ def draw_chart():
     rows.sort(key=lambda r: r[0])
     if not rows:
         return
+        
+def draw_category_chart():
+    pages = query_data_source(HOLDINGS_DS_ID)
+    totals = {}
+    for p in pages:
+        props = p["properties"]
+        qty = get_number(props["보유수량"])
+        if qty <= 0:
+            continue
+        category = get_select(props["분류"])
+        valuation = get_number(props["평가금액"])
+        totals[category] = totals.get(category, 0) + valuation
+
+    if not totals:
+        return
+
+    labels = list(totals.keys())
+    values = list(totals.values())
+    total_sum = sum(values)
+
+    os.makedirs("charts", exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    axes[0].pie(values, labels=labels, autopct="%1.1f%%", startangle=90)
+    axes[0].set_title("보유주식 분류별 비율")
+
+    axes[1].axis("off")
+    table_rows = [[label, f"{value:,.0f}원", f"{value / total_sum * 100:.1f}%"]
+                  for label, value in zip(labels, values)]
+    table_rows.append(["합계", f"{total_sum:,.0f}원", "100%"])
+    table = axes[1].table(cellText=table_rows, colLabels=["분류", "평가금액", "비율"],
+                           loc="center", cellLoc="center")
+    table.scale(1, 1.8)
+    axes[1].set_title("분류별 평가금액")
+
+    plt.tight_layout()
+    plt.savefig("charts/category_breakdown.png", dpi=150)
+    plt.close()
 
     dates = [r[0] for r in rows]
     values = [r[1] for r in rows]
@@ -254,6 +292,7 @@ def main():
 
     append_total_assets_snapshot(total_valuation, total_profit, total_cost)
     draw_chart()
+    draw_category_chart()  
     print("업데이트 완료")
 
 
