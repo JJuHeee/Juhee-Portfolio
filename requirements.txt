@@ -1,4 +1,4 @@
 requests
-FinanceDataReader
+finance-datareader
 pandas
 matplotlib
