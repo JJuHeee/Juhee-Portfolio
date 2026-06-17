@@ -359,6 +359,11 @@ def run_index_analysis():
         bench_ret = total_return_pct(b_series)
         if stock_ret is None or bench_ret is None:
             continue
+        if (stock_ret != stock_ret or bench_ret != bench_ret or
+                stock_ret in (float("inf"), float("-inf")) or
+                bench_ret in (float("inf"), float("-inf"))):
+            print(f"[WARN] {item['종목명']} 수익률 계산값이 비정상(NaN/Inf)이라 건너뜁니다.")
+            continue
 
         alpha = stock_ret - bench_ret
         verdict_label = verdict_for(alpha)
