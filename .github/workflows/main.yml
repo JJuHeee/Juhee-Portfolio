@@ -27,6 +27,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Install Korean font
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y fonts-nanum
+          fc-cache -fv
+
       - name: Run update script (Notion 업데이트 + 차트 생성)
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
