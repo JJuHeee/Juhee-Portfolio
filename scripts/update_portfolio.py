@@ -20,6 +20,10 @@ from datetime import datetime, timezone, timedelta
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+fm.fontManager.addfont("/usr/share/fonts/truetype/nanum/NanumGothic.ttf")
+plt.rcParams['font.family'] = 'NanumGothic'
+plt.rcParams['axes.unicode_minus'] = False
 
 try:
     import FinanceDataReader as fdr
