@@ -214,10 +214,22 @@ def append_total_assets_snapshot(total_valuation, total_profit, total_cost):
         "총수익": {"number": round(total_profit)},
         "총수익률": {"number": round(profit_rate, 4)},
     }
-    requests.post(
-        f"{BASE_URL}/pages", headers=HEADERS,
-        json={"parent": {"type": "data_source_id", "data_source_id": TOTAL_ASSETS_DS_ID},
-              "properties": properties}, timeout=30).raise_for_status()
+
+    # 오늘 날짜로 이미 기록된 행이 있으면 새로 추가하지 않고 그 행을 갱신합니다.
+    existing_id = None
+    for p in query_data_source(TOTAL_ASSETS_DS_ID):
+        if get_date(p["properties"]["작성일자"]) == today:
+            existing_id = p["id"]
+            break
+
+    if existing_id:
+        requests.patch(f"{BASE_URL}/pages/{existing_id}", headers=HEADERS,
+                        json={"properties": properties}, timeout=30).raise_for_status()
+    else:
+        requests.post(
+            f"{BASE_URL}/pages", headers=HEADERS,
+            json={"parent": {"type": "data_source_id", "data_source_id": TOTAL_ASSETS_DS_ID},
+                  "properties": properties}, timeout=30).raise_for_status()
 
 
 # ───────────────────────── 4) 차트 생성 ─────────────────────────
