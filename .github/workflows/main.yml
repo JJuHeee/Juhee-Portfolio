@@ -32,6 +32,6 @@ jobs:
         run: |
           git config user.name "swing-portfolio-bot"
           git config user.email "actions@github.com"
-          git add charts/total_assets.png
+          git add charts/
           git diff --quiet --cached || git commit -m "chore: update total assets chart"
           git push
