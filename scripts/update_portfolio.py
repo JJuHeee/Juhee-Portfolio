@@ -1,12 +1,13 @@
 """
 SWING Portfolio 자동 업데이트 스크립트
 
-흐름: 매매일지(Trade Log) 조회 -> 보유주식(Holdings) 갱신 -> 총자산(Total Assets)에
-오늘자 스냅샷 1행 추가 -> 총자산 추이 차트 생성
+흐름:
+1) 매매일지 조회 -> 보유주식 갱신 -> 총자산에 오늘자 스냅샷 추가 -> 총자산/분류별 차트 생성
+2) 관심종목(워치리스트)을 기준지수(코스피200/S&P500/나스닥100) 대비 6개월 수익률로 분석하고
+   알파값(초과수익률) 기준으로 판정(유지/매수확대/손절검토)을 매겨 갱신 -> 대조 차트 생성
 
-원칙: 기존 행/블록은 절대 삭제하지 않습니다. 보유주식은 티커가 같으면 업데이트(patch),
-처음 보는 티커면 새 행을 추가(create)합니다. 총자산은 매 실행마다 새 행을 "추가"하여
-히스토리를 쌓습니다 (과거 행 수정/삭제 없음).
+원칙: 기존 행/블록은 절대 삭제하지 않습니다. 보유주식·관심종목은 기존 행을 찾으면 patch,
+없으면 새로 생성합니다. 총자산은 매 실행마다 새 행을 "추가"하여 히스토리를 쌓습니다.
 
 실행 환경: GitHub Actions (스케줄 + 수동 실행)
 필요 환경변수: NOTION_TOKEN (Notion Internal Integration Token, GitHub Secrets에 등록)
@@ -29,6 +30,16 @@ except ImportError:
 TRADE_LOG_DS_ID = "9a0c7b65-17c2-4042-973d-075ed4421ba0"     # 매매일지
 HOLDINGS_DS_ID = "89b0cb64-c32a-4646-a336-72af409d81f5"      # 보유주식
 TOTAL_ASSETS_DS_ID = "14fc5390-f230-4332-8682-740ab1548b86"  # 총자산
+WATCHLIST_DS_ID = "fb2cee25-90a8-41e5-9224-50eb53b3d05b"     # 관심종목
+
+# 나스닥100은 FinanceDataReader가 지수 코드를 직접 지원하지 않아 추적 ETF인 QQQ로 대체합니다.
+BENCHMARK_TICKERS = {
+    "코스피200": "KS200",
+    "S&P500": "S&P500",
+    "나스닥100": "QQQ",
+}
+ALPHA_SELL_THRESHOLD = -10   # 알파값이 이 값 이하면 "손절검토"
+ALPHA_BUY_THRESHOLD = 40     # 알파값이 이 값 이상이면 "매수확대" (명시 안 된 임의 기준값, 필요시 조정)
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]  # GitHub Secrets에서 주입됩니다
 NOTION_VERSION = "2025-09-03"
@@ -131,7 +142,7 @@ def compute_holdings(trades):
 
 
 def get_price(ticker):
-    """KRX 종가 기준 현재가를 가져옵니다. 실패 시 None."""
+    """KRX/해외 종가 기준 현재가를 가져옵니다. 실패 시 None."""
     if fdr is None:
         return None
     try:
@@ -142,14 +153,14 @@ def get_price(ticker):
         return None
 
 
+_holdings_cache = None
+
+
 def find_holding_page(ticker, cache):
     if cache is None:
         cache = {get_rich_text(p["properties"]["티커"]): p["id"]
                  for p in query_data_source(HOLDINGS_DS_ID)}
     return cache.get(ticker), cache
-
-
-_holdings_cache = None
 
 
 def upsert_holding(holding):
@@ -205,7 +216,7 @@ def append_total_assets_snapshot(total_valuation, total_profit, total_cost):
               "properties": properties}, timeout=30).raise_for_status()
 
 
-# ───────────────────────── 4) 차트 생성 (GitHub에 직접 저장) ─────────────────────────
+# ───────────────────────── 4) 차트 생성 ─────────────────────────
 
 def draw_chart():
     pages = query_data_source(TOTAL_ASSETS_DS_ID)
@@ -219,7 +230,21 @@ def draw_chart():
     rows.sort(key=lambda r: r[0])
     if not rows:
         return
-        
+
+    dates = [r[0] for r in rows]
+    values = [r[1] for r in rows]
+
+    os.makedirs("charts", exist_ok=True)
+    plt.figure(figsize=(9, 4))
+    plt.plot(dates, values, marker="o", linewidth=2)
+    plt.title("SWING Portfolio 총자산 추이")
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("총평가금액 (원)")
+    plt.tight_layout()
+    plt.savefig("charts/total_assets.png", dpi=150)
+    plt.close()
+
+
 def draw_category_chart():
     pages = query_data_source(HOLDINGS_DS_ID)
     totals = {}
@@ -258,17 +283,127 @@ def draw_category_chart():
     plt.savefig("charts/category_breakdown.png", dpi=150)
     plt.close()
 
-    dates = [r[0] for r in rows]
-    values = [r[1] for r in rows]
+
+# ───────────────────────── 5) 관심종목 지수 분석 ─────────────────────────
+
+def fetch_watchlist():
+    pages = query_data_source(WATCHLIST_DS_ID)
+    items = []
+    for p in pages:
+        props = p["properties"]
+        items.append({
+            "page_id": p["id"],
+            "종목명": get_title(props["종목명"]),
+            "티커": get_rich_text(props["티커"]),
+            "기준지수": get_select(props["기준지수"]),
+        })
+    return items
+
+
+def total_return_pct(series):
+    if series is None or len(series) < 2:
+        return None
+    return (series.iloc[-1] / series.iloc[0] - 1) * 100
+
+
+def normalized_pct_series(series):
+    return (series / series.iloc[0] - 1) * 100
+
+
+def verdict_for(alpha):
+    if alpha <= ALPHA_SELL_THRESHOLD:
+        return "손절검토"
+    if alpha >= ALPHA_BUY_THRESHOLD:
+        return "매수확대"
+    return "유지"
+
+
+def run_index_analysis():
+    if fdr is None:
+        return
+    watchlist = fetch_watchlist()
+    if not watchlist:
+        return
+
+    start_date = (datetime.now(KST) - timedelta(days=183)).strftime("%Y-%m-%d")
+    benchmark_series_cache = {}
+    chart_groups = {}  # 기준지수 -> {"benchmark_series", "benchmark_ret", "stocks": [(name, series, ret)]}
+
+    for item in watchlist:
+        bench_name = item["기준지수"]
+        if bench_name not in benchmark_series_cache:
+            bench_ticker = BENCHMARK_TICKERS.get(bench_name)
+            try:
+                b_df = fdr.DataReader(bench_ticker, start_date)
+                benchmark_series_cache[bench_name] = b_df["Close"]
+            except Exception as e:
+                print(f"[WARN] 기준지수 {bench_name}({bench_ticker}) 조회 실패: {e}")
+                benchmark_series_cache[bench_name] = None
+
+        b_series = benchmark_series_cache[bench_name]
+        if b_series is None:
+            continue
+
+        try:
+            s_df = fdr.DataReader(item["티커"], start_date)
+            s_series = s_df["Close"]
+        except Exception as e:
+            print(f"[WARN] {item['종목명']}({item['티커']}) 시세 조회 실패: {e}")
+            continue
+
+        stock_ret = total_return_pct(s_series)
+        bench_ret = total_return_pct(b_series)
+        if stock_ret is None or bench_ret is None:
+            continue
+
+        alpha = stock_ret - bench_ret
+        verdict_label = verdict_for(alpha)
+
+        properties = {
+            "6개월수익률": {"number": round(stock_ret / 100, 4)},
+            "기준지수수익률": {"number": round(bench_ret / 100, 4)},
+            "알파값": {"number": round(alpha / 100, 4)},
+            "판정": {"select": {"name": verdict_label}},
+        }
+        requests.patch(f"{BASE_URL}/pages/{item['page_id']}", headers=HEADERS,
+                        json={"properties": properties}, timeout=30).raise_for_status()
+
+        group = chart_groups.setdefault(bench_name, {
+            "benchmark_series": normalized_pct_series(b_series),
+            "benchmark_ret": bench_ret,
+            "stocks": [],
+        })
+        group["stocks"].append((item["종목명"], normalized_pct_series(s_series), stock_ret))
+
+    draw_index_chart(chart_groups)
+
+
+def draw_index_chart(chart_groups):
+    order = ["코스피200", "S&P500", "나스닥100"]
+    groups = [name for name in order if name in chart_groups]
+    if not groups:
+        return
 
     os.makedirs("charts", exist_ok=True)
-    plt.figure(figsize=(9, 4))
-    plt.plot(dates, values, marker="o", linewidth=2)
-    plt.title("SWING Portfolio 총자산 추이")
-    plt.xticks(rotation=45, ha="right")
-    plt.ylabel("총평가금액 (원)")
+    fig, axes = plt.subplots(len(groups), 1, figsize=(9, 4 * len(groups)))
+    if len(groups) == 1:
+        axes = [axes]
+
+    for ax, bench_name in zip(axes, groups):
+        group = chart_groups[bench_name]
+        ax.plot(group["benchmark_series"].index, group["benchmark_series"].values,
+                linestyle="--", color="gray",
+                label=f"{bench_name} ({group['benchmark_ret']:+.1f}%)")
+        for name, series, ret in group["stocks"]:
+            ax.plot(series.index, series.values, label=f"{name} ({ret:+.1f}%)")
+        ax.set_title(f"vs {bench_name}")
+        ax.set_ylabel("수익률 (%)")
+        ax.legend(fontsize=8, loc="upper left")
+        ax.axhline(0, color="lightgray", linewidth=0.8)
+
+    fig.suptitle("관심종목 6개월 수익률 대조")
     plt.tight_layout()
-    plt.savefig("charts/total_assets.png", dpi=150)
+    plt.savefig("charts/index_comparison.png", dpi=150)
     plt.close()
 
 
@@ -276,23 +411,24 @@ def draw_category_chart():
 
 def main():
     trades = fetch_trade_log()
-    if not trades:
-        print("매매일지가 비어 있습니다. 종료합니다.")
-        return
+    if trades:
+        book = compute_holdings(trades)
 
-    book = compute_holdings(trades)
+        total_valuation = total_profit = total_cost = 0.0
+        for holding in book.values():
+            result = upsert_holding(holding)
+            if holding["보유수량"] > 0:
+                total_valuation += result["valuation"]
+                total_profit += result["profit"]
+                total_cost += result["cost"]
 
-    total_valuation = total_profit = total_cost = 0.0
-    for holding in book.values():
-        result = upsert_holding(holding)  # 수량 0이 되어도 행은 삭제하지 않고 갱신만 합니다
-        if holding["보유수량"] > 0:
-            total_valuation += result["valuation"]
-            total_profit += result["profit"]
-            total_cost += result["cost"]
+        append_total_assets_snapshot(total_valuation, total_profit, total_cost)
+        draw_chart()
+        draw_category_chart()
+    else:
+        print("매매일지가 비어 있어 보유주식/총자산 갱신을 건너뜁니다.")
 
-    append_total_assets_snapshot(total_valuation, total_profit, total_cost)
-    draw_chart()
-    draw_category_chart()  
+    run_index_analysis()
     print("업데이트 완료")
 
 
