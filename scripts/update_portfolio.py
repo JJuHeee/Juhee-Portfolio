@@ -473,44 +473,79 @@ def draw_index_chart(chart_groups):
 
 # ───────────────────────── 7) 국내 주도대장주 분석 ─────────────────────────
 
-def find_recent_wics_date(max_tries=10):
+def find_recent_wics_date(max_tries=30):
     """오늘부터 거슬러 올라가며 WICS 데이터가 존재하는 가장 최근 영업일을 찾습니다."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.wiseindex.com/Index/Index?G10="
+    }
+
     d = datetime.now(KST)
+
     for _ in range(max_tries):
         date_str = d.strftime("%Y%m%d")
-        url = (f"http://www.wiseindex.com/Index/GetIndexComponets"
-               f"?ceil_yn=0&dt={date_str}&idx=WICS&seq=G10")
+        url = (
+            "https://www.wiseindex.com/Index/GetIndexComponets"
+            f"?ceil_yn=0&dt={date_str}&sec_cd=G10"
+        )
+
         try:
             resp = requests.get(url, headers=headers, timeout=15)
+            print(f"[DEBUG] WICS 날짜 확인: {date_str}, status={resp.status_code}")
+
+            resp.raise_for_status()
             data = resp.json()
+
             if data.get("list"):
                 return date_str
-        except Exception:
-            pass
-        d -= timedelta(days=1)
-    raise RuntimeError("최근 영업일의 WICS 데이터를 찾지 못했습니다.")
 
+        except Exception as e:
+            print(f"[WARN] WICS 날짜 확인 실패: {date_str} / {e}")
+
+        d -= timedelta(days=1)
+
+    raise RuntimeError("최근 WICS 데이터를 찾지 못했습니다. WiseIndex API URL 또는 차단 여부를 확인하세요.")
 
 def fetch_wics_data(date_str):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.wiseindex.com/Index/Index?G10="
+    }
+
     rows = []
+
     for sector_name, seq in WICS_SECTORS.items():
-        url = (f"http://www.wiseindex.com/Index/GetIndexComponets"
-               f"?ceil_yn=0&dt={date_str}&idx=WICS&seq={seq}")
-        resp = requests.get(url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        url = (
+            "https://www.wiseindex.com/Index/GetIndexComponets"
+            f"?ceil_yn=0&dt={date_str}&sec_cd={seq}"
+        )
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            print(f"[DEBUG] WICS 수집: {sector_name} {seq}, status={resp.status_code}")
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"[WARN] WICS 수집 실패: {sector_name}({seq}) / {e}")
+            continue
+
         for item in data.get("list", []):
             rows.append({
-                "종목코드": item.get("CMP_CD"),
+                "종목코드": str(item.get("CMP_CD")).zfill(6),
                 "종목명": item.get("CMP_KOR"),
                 "섹터": sector_name,
             })
+
         time.sleep(0.3)
+
     df = pd.DataFrame(rows)
+
+    if df.empty:
+        raise RuntimeError("WICS 데이터를 수집했지만 결과가 비어 있습니다.")
+
     print(f"[INFO] WICS 수집 완료: {len(df)}개 종목")
     print(df.groupby("섹터").size())
+
     return df
 
 
@@ -730,7 +765,12 @@ def main():
         print("매매일지가 비어 있어 보유주식/총자산 갱신을 건너뜁니다.")
 
     run_index_analysis()
-    run_leading_stocks_analysis()
+
+    try:
+        run_leading_stocks_analysis()
+    except Exception as e:
+        print(f"[WARN] 주도대장주 분석 실패로 건너뜁니다: {e}")
+
     print("업데이트 완료")
 
 
