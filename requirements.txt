@@ -1,0 +1,4 @@
+requests
+FinanceDataReader
+pandas
+matplotlib
